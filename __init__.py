@@ -1,29 +1,52 @@
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
-
 bl_info = {
-    "name": "ADDON_NAME",
-    "author": "AUTHOR_NAME",
-    "description": "",
-    "blender": (2, 80, 0),
-    "version": (0, 0, 1),
-    "location": "",
+    "name": "ArtPipe",
+    "author": "Marek Hanzelka",
+    "description": "Adds an ArtPipe sidebar panel with an asset name field.",
+    "blender": (5, 0, 0),
+    "version": (1, 0, 0),
+    "location": "View3D > Sidebar > ArtPipe",
     "warning": "",
-    "category": "Generic",
+    "category": "3D View",
 }
 
+import bpy
+from bpy.props import StringProperty
+from bpy.types import Panel, Scene
 
-def register(): ...
+
+class ARTPIPE_PT_main_panel(Panel):
+    bl_label = "ArtPipe"
+    bl_idname = "ARTPIPE_PT_main_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ArtPipe"
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+
+        layout.prop(scene, "artpipe_asset_name", text="Asset Name")
 
 
-def unregister(): ...
+classes = (
+    ARTPIPE_PT_main_panel,
+)
+
+
+def register():
+    Scene.artpipe_asset_name = StringProperty(
+        name="Asset Name",
+        description="Name of the asset used by ArtPipe",
+        default="",
+    )
+
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+    del Scene.artpipe_asset_name
+
