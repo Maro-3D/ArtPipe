@@ -513,15 +513,13 @@ def _artpipe_export_collection(
                 pass
 
 
-def _artpipe_find_substance_texture_files(asset_name):
+def _artpipe_find_substance_texture_files(texture_root):
     import os
 
-    if not asset_name or not bpy.data.is_saved:
+    if not texture_root:
         return {}
 
-    blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
-    substance_root = os.path.join(blend_dir, "substance", asset_name)
-    if not os.path.isdir(substance_root):
+    if not os.path.isdir(texture_root):
         return {}
 
     texture_map = {
@@ -537,7 +535,7 @@ def _artpipe_find_substance_texture_files(asset_name):
     image_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".bmp", ".exr"}
     found = {}
 
-    for root, _, files in os.walk(substance_root):
+    for root, _, files in os.walk(texture_root):
         for file_name in files:
             ext = os.path.splitext(file_name)[1].lower()
             if ext not in image_exts:
@@ -552,6 +550,33 @@ def _artpipe_find_substance_texture_files(asset_name):
                     break
 
     return found
+
+
+def _artpipe_iter_substance_material_folders(asset_name):
+    import os
+
+    if not asset_name or not bpy.data.is_saved:
+        return []
+
+    blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+    export_root = os.path.join(blend_dir, "substance", asset_name, "export")
+    if not os.path.isdir(export_root):
+        return []
+
+    material_folders = []
+    for entry in os.scandir(export_root):
+        if not entry.is_dir():
+            continue
+
+        material_name = entry.name.strip()
+        if not material_name:
+            continue
+
+        texture_paths = _artpipe_find_substance_texture_files(entry.path)
+        if texture_paths:
+            material_folders.append((material_name, entry.path, texture_paths))
+
+    return sorted(material_folders, key=lambda item: item[0].lower())
 
 
 def _artpipe_load_image(texture_path, colorspace):
@@ -587,6 +612,13 @@ def _artpipe_build_substance_material(material, texture_paths):
     node_tree = material.node_tree
     if node_tree is None:
         raise RuntimeError("Material has no node tree.")
+
+    # Blender 4.2+ uses surface_render_method; older APIs use blend_method.
+    if hasattr(material, "surface_render_method"):
+        try:
+            material.surface_render_method = "DITHERED"
+        except (TypeError, ValueError):
+            pass
 
     nodes = node_tree.nodes
     links = node_tree.links
@@ -660,20 +692,32 @@ def _artpipe_build_substance_material(material, texture_paths):
     opacity_node = add_image_node("opacity", "Opacity", -950, "Non-Color")
     if opacity_node is not None:
         links.new(opacity_node.outputs["Color"], principled.inputs["Alpha"])
-        material.blend_method = "BLEND"
+        if hasattr(material, "surface_render_method"):
+            try:
+                material.surface_render_method = "DITHERED"
+            except (TypeError, ValueError):
+                pass
+        elif hasattr(material, "blend_method"):
+            material.blend_method = "HASHED"
 
 
-def _artpipe_create_or_refresh_substance_material(asset_name):
-    texture_paths = _artpipe_find_substance_texture_files(asset_name)
-    if not texture_paths:
-        raise RuntimeError("No Substance textures were found for the current asset.")
+def _artpipe_create_or_refresh_substance_materials(asset_name):
+    material_folders = _artpipe_iter_substance_material_folders(asset_name)
+    if not material_folders:
+        raise RuntimeError(
+            "No Substance material folders with textures were found in the asset export folder."
+        )
 
-    material = bpy.data.materials.get("M_substance_import")
-    if material is None:
-        material = bpy.data.materials.new(name="M_substance_import")
+    materials = []
+    for material_name, _, texture_paths in material_folders:
+        material = bpy.data.materials.get(material_name)
+        if material is None:
+            material = bpy.data.materials.new(name=material_name)
 
-    _artpipe_build_substance_material(material, texture_paths)
-    return material
+        _artpipe_build_substance_material(material, texture_paths)
+        materials.append(material)
+
+    return materials
 
 
 class ARTPIPE_OT_setup_collections(Operator):
@@ -1014,6 +1058,125 @@ class ARTPIPE_OT_open_export_path(Operator):
             return {"CANCELLED"}
 
 
+class ARTPIPE_OT_open_substance_texture_path(Operator):
+    bl_idname = "artpipe.open_substance_texture_path"
+    bl_label = "Open Substance Texture Path"
+    bl_description = "Open the Substance texture folder in the system file browser"
+    bl_options = {"REGISTER"}
+
+    mode: bpy.props.EnumProperty(
+        items=(
+            ("ROOT", "Root", "Open the asset Substance folder"),
+            ("EXPORT", "Export", "Open the Substance export folder"),
+            ("IMPORT", "Import", "Open the Substance import folder"),
+            ("IMPORT_CAGE", "Import Cage", "Open the Substance cage import folder"),
+        ),
+        default="ROOT",
+        options={"HIDDEN"},
+    )
+
+    @staticmethod
+    def _resolve_target(asset_name):
+        import os
+
+        blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+        substance_dir = os.path.join(blend_dir, "substance", asset_name)
+        return {
+            "ROOT": substance_dir,
+            "EXPORT": os.path.join(substance_dir, "export"),
+            "IMPORT": os.path.join(substance_dir, "import"),
+            "IMPORT_CAGE": os.path.join(substance_dir, "import_cage"),
+        }
+
+    def execute(self, context):
+        import os
+        import platform
+        import subprocess
+
+        scene = context.scene
+        asset_name = scene.artpipe_asset_name
+        if not asset_name or asset_name == "NONE":
+            self.report({"ERROR"}, "Choose an asset first.")
+            return {"CANCELLED"}
+
+        if not bpy.data.is_saved:
+            self.report({"ERROR"}, "Save the blend file first.")
+            return {"CANCELLED"}
+
+        target = self._resolve_target(asset_name).get(self.mode, self._resolve_target(asset_name)["ROOT"])
+
+        if not os.path.isdir(target):
+            try:
+                os.makedirs(target, exist_ok=True)
+            except Exception:
+                self.report({"ERROR"}, f"Substance folder does not exist: {target}")
+                return {"CANCELLED"}
+
+        try:
+            bpy.ops.wm.path_open(filepath=target)
+            return {"FINISHED"}
+        except Exception:
+            pass
+
+        try:
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(target)
+            elif system == "Darwin":
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Failed to open path: {exc}")
+            return {"CANCELLED"}
+
+
+class ARTPIPE_OT_copy_substance_texture_path(Operator):
+    bl_idname = "artpipe.copy_substance_texture_path"
+    bl_label = "Copy Substance Texture Path"
+    bl_description = "Copy the Substance folder path to the clipboard"
+    bl_options = {"REGISTER"}
+
+    mode: bpy.props.EnumProperty(
+        items=(
+            ("ROOT", "Root", "Copy the asset Substance folder path"),
+            ("EXPORT", "Export", "Copy the Substance export folder path"),
+            ("IMPORT", "Import", "Copy the Substance import folder path"),
+            ("IMPORT_CAGE", "Import Cage", "Copy the Substance cage import folder path"),
+        ),
+        default="ROOT",
+        options={"HIDDEN"},
+    )
+
+    def execute(self, context):
+        import os
+
+        scene = context.scene
+        asset_name = scene.artpipe_asset_name
+        if not asset_name or asset_name == "NONE":
+            self.report({"ERROR"}, "Choose an asset first.")
+            return {"CANCELLED"}
+
+        if not bpy.data.is_saved:
+            self.report({"ERROR"}, "Save the blend file first.")
+            return {"CANCELLED"}
+
+        target = ARTPIPE_OT_open_substance_texture_path._resolve_target(asset_name).get(
+            self.mode,
+            ARTPIPE_OT_open_substance_texture_path._resolve_target(asset_name)["ROOT"],
+        )
+
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception:
+            pass
+
+        context.window_manager.clipboard = target
+        self.report({"INFO"}, f"Copied path: {target}")
+        return {"FINISHED"}
+
+
 class ARTPIPE_OT_export_substance(Operator):
     bl_idname = "artpipe.export_substance"
     bl_label = "Exp. Substance"
@@ -1079,7 +1242,7 @@ class ARTPIPE_OT_export_substance(Operator):
 class ARTPIPE_OT_load_substance_textures(Operator):
     bl_idname = "artpipe.load_substance_textures"
     bl_label = "Load Textures from Substance"
-    bl_description = "Create or refresh M_substance_import from textures found in the asset's substance folder"
+    bl_description = "Create or refresh Blender materials from textures found in the asset's Substance export folders"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1093,8 +1256,14 @@ class ARTPIPE_OT_load_substance_textures(Operator):
             return {"CANCELLED"}
 
         try:
-            material = _artpipe_create_or_refresh_substance_material(asset_name)
-            self.report({"INFO"}, f"Material '{material.name}' loaded from Substance textures.")
+            materials = _artpipe_create_or_refresh_substance_materials(asset_name)
+            material_names = ", ".join(material.name for material in materials[:5])
+            if len(materials) > 5:
+                material_names += ", ..."
+            self.report(
+                {"INFO"},
+                f"Loaded {len(materials)} Substance material(s): {material_names}",
+            )
             return {"FINISHED"}
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
@@ -1165,12 +1334,27 @@ class ARTPIPE_PT_export_settings(Panel):
         row = layout.row(align=True)
         row.enabled = bool(asset_name)
         row.operator("artpipe.export_substance", text="Exp. Substance")
+        copy_import = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
+        copy_import.mode = "IMPORT"
+        open_import = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
+        open_import.mode = "IMPORT"
+
+        row = layout.row(align=True)
+        row.enabled = bool(asset_name)
         cage_op = row.operator("artpipe.export_substance", text="Exp. Substance Cage")
         cage_op.cage = True
+        copy_import_cage = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
+        copy_import_cage.mode = "IMPORT_CAGE"
+        open_import_cage = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
+        open_import_cage.mode = "IMPORT_CAGE"
 
-        row = layout.row()
+        row = layout.row(align=True)
         row.enabled = bool(asset_name)
         row.operator("artpipe.load_substance_textures", text="Load Textures from Substance")
+        open_export = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
+        open_export.mode = "EXPORT"
+        open_export = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
+        open_export.mode = "EXPORT"
 
         if not asset_name:
             warning = layout.row()
@@ -1237,6 +1421,8 @@ classes = (
     ARTPIPE_OT_import_preset_file,
     ARTPIPE_OT_export,
     ARTPIPE_OT_open_export_path,
+    ARTPIPE_OT_copy_substance_texture_path,
+    ARTPIPE_OT_open_substance_texture_path,
     ARTPIPE_OT_export_substance,
     ARTPIPE_OT_load_substance_textures,
     ARTPIPE_PT_main_panel,
