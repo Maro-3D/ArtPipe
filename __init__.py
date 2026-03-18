@@ -254,6 +254,33 @@ def _artpipe_get_export_collection(asset_name):
     return None
 
 
+def _artpipe_get_wip_collection(asset_name):
+    if not asset_name:
+        return None
+
+    root_collection = bpy.data.collections.get(asset_name)
+    if root_collection is None:
+        return None
+
+    wip_name = _artpipe_collection_name("wip", asset_name)
+    for child in root_collection.children:
+        if child.name == wip_name:
+            return child
+    return None
+
+
+def _artpipe_get_wip_child_collection(asset_name, base_name):
+    wip_collection = _artpipe_get_wip_collection(asset_name)
+    if wip_collection is None:
+        return None
+
+    child_name = _artpipe_collection_name(base_name, asset_name)
+    for child in wip_collection.children:
+        if child.name == child_name:
+            return child
+    return None
+
+
 def _artpipe_find_layer_collection(layer_collection, target_collection):
     try:
         if layer_collection.collection == target_collection:
@@ -360,6 +387,293 @@ def _artpipe_create_asset_setup(context, asset_name):
         _artpipe_collection_name("substance_cage", asset_name),
         "COLOR_06",
     )
+
+
+def _artpipe_configure_collection_exporter(
+    collection,
+    export_type,
+    export_path,
+    preset_ident="DEFAULT",
+    property_overrides=None,
+):
+    type_config = {
+        "FBX": {"handlers": ("IO_FH_fbx", "IO_FH_FBX")},
+        "GLTF": {"handlers": ("IO_FH_gltf", "IO_FH_GLTF", "IO_FH_gltf2", "IO_FH_GLTF2")},
+    }
+    config = type_config.get(export_type)
+    if config is None:
+        raise RuntimeError(f"Unsupported export type: {export_type}")
+
+    exporters = getattr(collection, "exporters", None)
+    if exporters is None:
+        raise RuntimeError("Collection Exporters API is not available on this collection.")
+
+    try:
+        while len(exporters) > 0:
+            exporters.remove(exporters[0])
+    except Exception:
+        pass
+
+    added = False
+    for handler_name in config["handlers"]:
+        try:
+            bpy.ops.collection.exporter_add(name=handler_name)
+            added = True
+            break
+        except Exception:
+            continue
+    if not added:
+        raise RuntimeError(f"Failed to add {export_type} collection exporter.")
+
+    exporter = getattr(exporters, "active", None)
+    if exporter is None and len(exporters) > 0:
+        exporter = exporters[0]
+    if exporter is None:
+        raise RuntimeError("Could not access the collection exporter.")
+
+    props = getattr(exporter, "export_properties", None)
+    if props is None:
+        raise RuntimeError("Exporter has no export_properties.")
+
+    if preset_ident and preset_ident != "DEFAULT":
+        _artpipe_apply_preset_to_props(props, preset_ident)
+
+    if hasattr(props, "filepath"):
+        props.filepath = export_path
+    else:
+        setattr(props, "path", export_path)
+
+    if property_overrides:
+        for name, value in property_overrides.items():
+            if hasattr(props, name):
+                try:
+                    setattr(props, name, value)
+                except Exception:
+                    pass
+
+    if preset_ident and preset_ident != "DEFAULT":
+        for attr in ("preset", "preset_name"):
+            if hasattr(exporter, attr):
+                try:
+                    setattr(exporter, attr, preset_ident)
+                    break
+                except Exception:
+                    pass
+
+
+def _artpipe_export_collection(
+    context,
+    collection,
+    export_type,
+    export_path,
+    preset_ident="DEFAULT",
+    property_overrides=None,
+):
+    if not hasattr(bpy.ops.collection, "export_all"):
+        raise RuntimeError("This feature requires Blender with Collection Exporters.")
+
+    layer_collection = _artpipe_find_layer_collection(
+        context.view_layer.layer_collection,
+        collection,
+    )
+    if layer_collection is None:
+        raise RuntimeError("Could not find the target LayerCollection.")
+
+    original_flags = {}
+    visibility_attrs = ("exclude", "hide_viewport", "holdout", "indirect_only")
+    try:
+        for attr in visibility_attrs:
+            try:
+                original_flags[attr] = getattr(layer_collection, attr)
+            except Exception:
+                pass
+        for attr in visibility_attrs:
+            try:
+                setattr(layer_collection, attr, False)
+            except Exception:
+                pass
+        try:
+            context.view_layer.active_layer_collection = layer_collection
+        except Exception:
+            pass
+
+        _artpipe_configure_collection_exporter(
+            collection,
+            export_type,
+            export_path,
+            preset_ident,
+            property_overrides,
+        )
+        bpy.ops.collection.export_all()
+    finally:
+        for attr, value in original_flags.items():
+            try:
+                setattr(layer_collection, attr, value)
+            except Exception:
+                pass
+
+
+def _artpipe_find_substance_texture_files(asset_name):
+    import os
+
+    if not asset_name or not bpy.data.is_saved:
+        return {}
+
+    blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+    substance_root = os.path.join(blend_dir, "substance", asset_name)
+    if not os.path.isdir(substance_root):
+        return {}
+
+    texture_map = {
+        "base_color": ("basecolor", "base_color", "albedo", "diffuse", "color"),
+        "roughness": ("roughness",),
+        "metallic": ("metallic", "metalness"),
+        "normal": ("normal",),
+        "ao": ("ambientocclusion", "ambient_occlusion", "ao"),
+        "height": ("height", "displacement", "disp"),
+        "emission": ("emissive", "emission"),
+        "opacity": ("opacity", "alpha"),
+    }
+    image_exts = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga", ".bmp", ".exr"}
+    found = {}
+
+    for root, _, files in os.walk(substance_root):
+        for file_name in files:
+            ext = os.path.splitext(file_name)[1].lower()
+            if ext not in image_exts:
+                continue
+            lowered = os.path.splitext(file_name)[0].lower()
+            compact = lowered.replace(" ", "").replace("-", "_")
+            for key, aliases in texture_map.items():
+                if key in found:
+                    continue
+                if any(alias in compact for alias in aliases):
+                    found[key] = os.path.join(root, file_name)
+                    break
+
+    return found
+
+
+def _artpipe_load_image(texture_path, colorspace):
+    import os
+
+    abs_path = os.path.abspath(texture_path)
+    image = None
+    for existing in bpy.data.images:
+        try:
+            if os.path.abspath(bpy.path.abspath(existing.filepath)) == abs_path:
+                image = existing
+                break
+        except Exception:
+            pass
+
+    if image is None:
+        image = bpy.data.images.load(abs_path)
+    else:
+        try:
+            image.reload()
+        except Exception:
+            pass
+
+    try:
+        image.colorspace_settings.name = colorspace
+    except Exception:
+        pass
+    return image
+
+
+def _artpipe_build_substance_material(material, texture_paths):
+    material.use_nodes = True
+    node_tree = material.node_tree
+    if node_tree is None:
+        raise RuntimeError("Material has no node tree.")
+
+    nodes = node_tree.nodes
+    links = node_tree.links
+    nodes.clear()
+
+    output = nodes.new("ShaderNodeOutputMaterial")
+    output.location = (900, 0)
+    principled = nodes.new("ShaderNodeBsdfPrincipled")
+    principled.location = (600, 0)
+    links.new(principled.outputs["BSDF"], output.inputs["Surface"])
+
+    tex_coord = nodes.new("ShaderNodeTexCoord")
+    tex_coord.location = (-800, 0)
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.location = (-550, 0)
+    links.new(tex_coord.outputs["UV"], mapping.inputs["Vector"])
+
+    def add_image_node(key, label, y_pos, colorspace):
+        path = texture_paths.get(key)
+        if not path:
+            return None
+        image = _artpipe_load_image(path, colorspace)
+        node = nodes.new("ShaderNodeTexImage")
+        node.name = f"ARTPIPE_{key.upper()}"
+        node.label = label
+        node.image = image
+        node.location = (-250, y_pos)
+        links.new(mapping.outputs["Vector"], node.inputs["Vector"])
+        return node
+
+    base_node = add_image_node("base_color", "Base Color", 250, "sRGB")
+    if base_node is not None:
+        links.new(base_node.outputs["Color"], principled.inputs["Base Color"])
+
+    roughness_node = add_image_node("roughness", "Roughness", 50, "Non-Color")
+    if roughness_node is not None:
+        links.new(roughness_node.outputs["Color"], principled.inputs["Roughness"])
+
+    metallic_node = add_image_node("metallic", "Metallic", -150, "Non-Color")
+    if metallic_node is not None:
+        links.new(metallic_node.outputs["Color"], principled.inputs["Metallic"])
+
+    ao_node = add_image_node("ao", "Ambient Occlusion", 450, "Non-Color")
+    if ao_node is not None and base_node is not None:
+        mix_node = nodes.new("ShaderNodeMixRGB")
+        mix_node.blend_type = "MULTIPLY"
+        mix_node.inputs["Fac"].default_value = 1.0
+        mix_node.location = (180, 280)
+        links.new(base_node.outputs["Color"], mix_node.inputs["Color1"])
+        links.new(ao_node.outputs["Color"], mix_node.inputs["Color2"])
+        links.new(mix_node.outputs["Color"], principled.inputs["Base Color"])
+
+    normal_node = add_image_node("normal", "Normal", -350, "Non-Color")
+    if normal_node is not None:
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.location = (180, -350)
+        links.new(normal_node.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+
+    height_node = add_image_node("height", "Height", -550, "Non-Color")
+    if height_node is not None:
+        displacement = nodes.new("ShaderNodeDisplacement")
+        displacement.location = (180, -550)
+        links.new(height_node.outputs["Color"], displacement.inputs["Height"])
+        links.new(displacement.outputs["Displacement"], output.inputs["Displacement"])
+
+    emission_node = add_image_node("emission", "Emission", -750, "sRGB")
+    if emission_node is not None:
+        links.new(emission_node.outputs["Color"], principled.inputs["Emission Color"])
+
+    opacity_node = add_image_node("opacity", "Opacity", -950, "Non-Color")
+    if opacity_node is not None:
+        links.new(opacity_node.outputs["Color"], principled.inputs["Alpha"])
+        material.blend_method = "BLEND"
+
+
+def _artpipe_create_or_refresh_substance_material(asset_name):
+    texture_paths = _artpipe_find_substance_texture_files(asset_name)
+    if not texture_paths:
+        raise RuntimeError("No Substance textures were found for the current asset.")
+
+    material = bpy.data.materials.get("M_substance_import")
+    if material is None:
+        material = bpy.data.materials.new(name="M_substance_import")
+
+    _artpipe_build_substance_material(material, texture_paths)
+    return material
 
 
 class ARTPIPE_OT_setup_collections(Operator):
@@ -624,119 +938,19 @@ class ARTPIPE_OT_export(Operator):
             self.report({"ERROR"}, "Missing export collection. Create the asset setup first.")
             return {"CANCELLED"}
 
-        if not hasattr(bpy.ops.collection, "export_all"):
-            self.report({"ERROR"}, "This feature requires Blender with Collection Exporters.")
-            return {"CANCELLED"}
-
-        layer_collection = _artpipe_find_layer_collection(
-            context.view_layer.layer_collection,
-            export_collection,
-        )
-        if layer_collection is None:
-            self.report({"ERROR"}, "Could not find the export LayerCollection.")
-            return {"CANCELLED"}
-
-        original_flags = {}
-        visibility_attrs = ("exclude", "hide_viewport", "holdout", "indirect_only")
         try:
-            for attr in visibility_attrs:
-                try:
-                    original_flags[attr] = getattr(layer_collection, attr)
-                except Exception:
-                    pass
-            for attr in visibility_attrs:
-                try:
-                    setattr(layer_collection, attr, False)
-                except Exception:
-                    pass
-            try:
-                context.view_layer.active_layer_collection = layer_collection
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        try:
-            exporters = getattr(export_collection, "exporters", None)
-            if exporters is None:
-                self.report({"ERROR"}, "Collection Exporters API is not available on the export collection.")
-                return {"CANCELLED"}
-
-            try:
-                while len(exporters) > 0:
-                    exporters.remove(exporters[0])
-            except Exception:
-                pass
-
-            added = False
-            for handler_name in config["handlers"]:
-                try:
-                    bpy.ops.collection.exporter_add(name=handler_name)
-                    added = True
-                    break
-                except Exception:
-                    continue
-            if not added:
-                self.report({"ERROR"}, f"Failed to add {export_type} collection exporter.")
-                return {"CANCELLED"}
-
-            try:
-                exporter = getattr(exporters, "active", None)
-                if exporter is None and len(exporters) > 0:
-                    exporter = exporters[0]
-            except Exception:
-                exporter = None
-            if exporter is None:
-                self.report({"ERROR"}, "Could not access the export collection exporter.")
-                return {"CANCELLED"}
-
-            props = getattr(exporter, "export_properties", None)
-            if props is None:
-                self.report({"ERROR"}, "Exporter has no export_properties.")
-                return {"CANCELLED"}
-
-            if preset_ident and preset_ident != "DEFAULT":
-                try:
-                    _artpipe_apply_preset_to_props(props, preset_ident)
-                except Exception:
-                    pass
-
-            if hasattr(props, "filepath"):
-                try:
-                    props.filepath = export_path
-                except Exception:
-                    pass
-            else:
-                try:
-                    setattr(props, "path", export_path)
-                except Exception:
-                    pass
-
-            if preset_ident and preset_ident != "DEFAULT":
-                for attr in ("preset", "preset_name"):
-                    if hasattr(exporter, attr):
-                        try:
-                            setattr(exporter, attr, preset_ident)
-                            break
-                        except Exception:
-                            pass
-
-            try:
-                bpy.ops.collection.export_all()
-                self.report({"INFO"}, f"Exported {export_type} to: {export_path}")
-                return {"FINISHED"}
-            except Exception as exc:
-                self.report({"ERROR"}, f"Collection export failed: {exc}")
-                return {"CANCELLED"}
-        finally:
-            try:
-                for attr, value in original_flags.items():
-                    try:
-                        setattr(layer_collection, attr, value)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+            _artpipe_export_collection(
+                context,
+                export_collection,
+                export_type,
+                export_path,
+                preset_ident,
+            )
+            self.report({"INFO"}, f"Exported {export_type} to: {export_path}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Collection export failed: {exc}")
+            return {"CANCELLED"}
 
 
 class ARTPIPE_OT_open_export_path(Operator):
@@ -800,6 +1014,93 @@ class ARTPIPE_OT_open_export_path(Operator):
             return {"CANCELLED"}
 
 
+class ARTPIPE_OT_export_substance(Operator):
+    bl_idname = "artpipe.export_substance"
+    bl_label = "Exp. Substance"
+    bl_description = "Export the substance collection to the Substance import folder as GLTF"
+    bl_options = {"REGISTER", "UNDO"}
+
+    cage: bpy.props.BoolProperty(default=False, options={"HIDDEN"})
+
+    def execute(self, context):
+        import os
+
+        scene = context.scene
+        asset_name = scene.artpipe_asset_name
+        if not asset_name or asset_name == "NONE":
+            self.report({"ERROR"}, "Choose an asset first.")
+            return {"CANCELLED"}
+
+        if not bpy.data.is_saved:
+            self.report({"ERROR"}, "Save the blend file first.")
+            return {"CANCELLED"}
+
+        base_name = "substance_cage" if self.cage else "substance"
+        target_collection = _artpipe_get_wip_child_collection(asset_name, base_name)
+        if target_collection is None:
+            self.report({"ERROR"}, f"Missing collection '{_artpipe_collection_name(base_name, asset_name)}'.")
+            return {"CANCELLED"}
+
+        blend_dir = os.path.dirname(bpy.path.abspath(bpy.data.filepath))
+        substance_dir = os.path.join(blend_dir, "substance", asset_name)
+        export_dir = os.path.join(substance_dir, "export")
+        import_dir_name = "import_cage" if self.cage else "import"
+        import_dir = os.path.join(substance_dir, import_dir_name)
+
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            os.makedirs(import_dir, exist_ok=True)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Failed to create Substance folders: {exc}")
+            return {"CANCELLED"}
+
+        file_stem = f"{asset_name}_cage" if self.cage else asset_name
+        export_path = os.path.join(import_dir, f"{file_stem}.glb")
+
+        try:
+            _artpipe_export_collection(
+                context,
+                target_collection,
+                "GLTF",
+                export_path,
+                "DEFAULT",
+                {
+                    "export_apply": True,
+                },
+            )
+            label = "Substance Cage" if self.cage else "Substance"
+            self.report({"INFO"}, f"Exported {label} to: {export_path}")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Substance export failed: {exc}")
+            return {"CANCELLED"}
+
+
+class ARTPIPE_OT_load_substance_textures(Operator):
+    bl_idname = "artpipe.load_substance_textures"
+    bl_label = "Load Textures from Substance"
+    bl_description = "Create or refresh M_substance_import from textures found in the asset's substance folder"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        asset_name = context.scene.artpipe_asset_name
+        if not asset_name or asset_name == "NONE":
+            self.report({"ERROR"}, "Choose an asset first.")
+            return {"CANCELLED"}
+
+        if not bpy.data.is_saved:
+            self.report({"ERROR"}, "Save the blend file first.")
+            return {"CANCELLED"}
+
+        try:
+            material = _artpipe_create_or_refresh_substance_material(asset_name)
+            self.report({"INFO"}, f"Material '{material.name}' loaded from Substance textures.")
+            return {"FINISHED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+
 class ARTPIPE_PT_main_panel(Panel):
     bl_label = "ArtPipe"
     bl_idname = "ARTPIPE_PT_main_panel"
@@ -844,8 +1145,42 @@ class ARTPIPE_PT_asset_settings(Panel):
 
 
 class ARTPIPE_PT_export_settings(Panel):
-    bl_label = "Export Settings"
+    bl_label = "Export Subatnce"
     bl_idname = "ARTPIPE_PT_export_settings"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "ArtPipe"
+    bl_parent_id = "ARTPIPE_PT_main_panel"
+    bl_order = 20
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        state = _artpipe_ui_state(context)
+        scene = state["scene"]
+        asset_name = state["asset_name"]
+
+        row = layout.row(align=True)
+        row.enabled = bool(asset_name)
+        row.operator("artpipe.export_substance", text="Exp. Substance")
+        cage_op = row.operator("artpipe.export_substance", text="Exp. Substance Cage")
+        cage_op.cage = True
+
+        row = layout.row()
+        row.enabled = bool(asset_name)
+        row.operator("artpipe.load_substance_textures", text="Load Textures from Substance")
+
+        if not asset_name:
+            warning = layout.row()
+            warning.alert = True
+            warning.label(text="Choose an asset to export Substance files.", icon="INFO")
+
+
+class ARTPIPE_PT_standard_export_settings(Panel):
+    bl_label = "Export Engine"
+    bl_idname = "ARTPIPE_PT_standard_export_settings"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "ArtPipe"
@@ -902,9 +1237,12 @@ classes = (
     ARTPIPE_OT_import_preset_file,
     ARTPIPE_OT_export,
     ARTPIPE_OT_open_export_path,
+    ARTPIPE_OT_export_substance,
+    ARTPIPE_OT_load_substance_textures,
     ARTPIPE_PT_main_panel,
     ARTPIPE_PT_asset_settings,
     ARTPIPE_PT_export_settings,
+    ARTPIPE_PT_standard_export_settings,
 )
 
 
