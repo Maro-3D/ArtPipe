@@ -194,11 +194,49 @@ def _artpipe_set_asset_value(asset_name, key, value):
         pass
 
 
+def _artpipe_sync_asset_view_layer_visibility(context, active_asset_name):
+    if context is None:
+        return
+
+    scene_collection = getattr(getattr(context, "scene", None), "collection", None)
+    view_layer = getattr(context, "view_layer", None)
+    if scene_collection is None or view_layer is None:
+        return
+
+    active_layer_collection = None
+    for collection in scene_collection.children:
+        if not _artpipe_is_asset_collection(collection):
+            continue
+
+        layer_collection = _artpipe_find_layer_collection(
+            view_layer.layer_collection,
+            collection,
+        )
+        if layer_collection is None:
+            continue
+
+        should_exclude = bool(active_asset_name) and collection.name != active_asset_name
+        try:
+            layer_collection.exclude = should_exclude
+        except Exception:
+            pass
+
+        if collection.name == active_asset_name:
+            active_layer_collection = layer_collection
+
+    if active_layer_collection is not None:
+        try:
+            view_layer.active_layer_collection = active_layer_collection
+        except Exception:
+            pass
+
+
 def _artpipe_on_asset_changed(self, context):
     asset_name = self.artpipe_asset_name
     if not asset_name or asset_name == "NONE":
         self.artpipe_export_preset = "DEFAULT"
         self.artpipe_export_path = ""
+        _artpipe_sync_asset_view_layer_visibility(context, "")
         return
 
     self.artpipe_export_preset = _artpipe_get_asset_value(
@@ -211,6 +249,7 @@ def _artpipe_on_asset_changed(self, context):
         "artpipe_export_path",
         "",
     )
+    _artpipe_sync_asset_view_layer_visibility(context, asset_name)
 
 
 def _artpipe_on_export_preset_changed(self, context):
