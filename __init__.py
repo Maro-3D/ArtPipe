@@ -1270,6 +1270,55 @@ class ARTPIPE_OT_load_substance_textures(Operator):
             return {"CANCELLED"}
 
 
+def _artpipe_draw_status_box(layout, lines, icon="INFO", alert=False):
+    if isinstance(lines, str):
+        lines = [lines]
+
+    box = layout.box()
+    column = box.column(align=True)
+    for index, line in enumerate(lines):
+        row = column.row()
+        row.alert = alert
+        row.label(text=line, icon=icon if index == 0 else "BLANK1")
+
+
+def _artpipe_draw_primary_action_row(
+    layout,
+    operator_id,
+    text,
+    enabled=True,
+    icon="NONE",
+    operator_attrs=None,
+    copy_mode=None,
+    open_mode=None,
+):
+    row = layout.row(align=True)
+    row.enabled = enabled
+
+    split = row.split(factor=0.82, align=True)
+    primary = split.row(align=True)
+    action = primary.operator(operator_id, text=text, icon=icon)
+    if operator_attrs:
+        for name, value in operator_attrs.items():
+            setattr(action, name, value)
+
+    tools = split.row(align=True)
+    if copy_mode is not None:
+        copy_op = tools.operator(
+            "artpipe.copy_substance_texture_path",
+            text="",
+            icon="COPYDOWN",
+        )
+        copy_op.mode = copy_mode
+    if open_mode is not None:
+        open_op = tools.operator(
+            "artpipe.open_substance_texture_path",
+            text="",
+            icon="FOLDER_REDIRECT",
+        )
+        open_op.mode = open_mode
+
+
 class ARTPIPE_PT_main_panel(Panel):
     bl_label = "ArtPipe"
     bl_idname = "ARTPIPE_PT_main_panel"
@@ -1301,20 +1350,24 @@ class ARTPIPE_PT_asset_settings(Panel):
         scene = state["scene"]
         asset_name = state["asset_name"]
 
-        row = layout.row(align=True)
+        box = layout.box()
+        col = box.column(align=True)
+
+        row = col.row(align=True)
         row.prop(scene, "artpipe_asset_name", text="Asset")
         row.operator("artpipe.add_asset", text="", icon="ADD")
 
-        row = layout.row()
-        row.prop(scene, "artpipe_armature_obj", text="Armature")
+        col.prop(scene, "artpipe_armature_obj", text="Armature")
 
         if not asset_name:
-            info = layout.row()
-            info.label(text="Add an asset to create its collection setup.", icon="INFO")
+            _artpipe_draw_status_box(
+                layout,
+                "Add an asset to create its collection setup.",
+            )
 
 
 class ARTPIPE_PT_export_settings(Panel):
-    bl_label = "Export Subatnce"
+    bl_label = "Substance Export"
     bl_idname = "ARTPIPE_PT_export_settings"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -1328,38 +1381,53 @@ class ARTPIPE_PT_export_settings(Panel):
         layout.use_property_decorate = False
 
         state = _artpipe_ui_state(context)
-        scene = state["scene"]
         asset_name = state["asset_name"]
 
-        row = layout.row(align=True)
-        row.enabled = bool(asset_name)
-        row.operator("artpipe.export_substance", text="Exp. Substance")
-        copy_import = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
-        copy_import.mode = "IMPORT"
-        open_import = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
-        open_import.mode = "IMPORT"
+        export_box = layout.box()
+        export_col = export_box.column(align=True)
+        export_col.label(text="Send Meshes to Substance", icon="EXPORT")
+        _artpipe_draw_primary_action_row(
+            export_col,
+            "artpipe.export_substance",
+            "Export Asset Mesh",
+            enabled=bool(asset_name),
+            icon="MESH_DATA",
+            copy_mode="IMPORT",
+            open_mode="IMPORT",
+        )
+        _artpipe_draw_primary_action_row(
+            export_col,
+            "artpipe.export_substance",
+            "Export Cage Mesh",
+            enabled=bool(asset_name),
+            icon="MOD_LATTICE",
+            operator_attrs={"cage": True},
+            copy_mode="IMPORT_CAGE",
+            open_mode="IMPORT_CAGE",
+        )
 
-        row = layout.row(align=True)
-        row.enabled = bool(asset_name)
-        cage_op = row.operator("artpipe.export_substance", text="Exp. Substance Cage")
-        cage_op.cage = True
-        copy_import_cage = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
-        copy_import_cage.mode = "IMPORT_CAGE"
-        open_import_cage = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
-        open_import_cage.mode = "IMPORT_CAGE"
-
-        row = layout.row(align=True)
-        row.enabled = bool(asset_name)
-        row.operator("artpipe.load_substance_textures", text="Load Textures from Substance")
-        open_export = row.operator("artpipe.copy_substance_texture_path", text="", icon="COPYDOWN")
-        open_export.mode = "EXPORT"
-        open_export = row.operator("artpipe.open_substance_texture_path", text="", icon="FOLDER_REDIRECT")
-        open_export.mode = "EXPORT"
+        material_box = layout.box()
+        material_col = material_box.column(align=True)
+        material_col.label(text="Bring Textures Back", icon="MATERIAL")
+        _artpipe_draw_primary_action_row(
+            material_col,
+            "artpipe.load_substance_textures",
+            "Load Textures from Export Folder",
+            enabled=bool(asset_name),
+            icon="TEXTURE",
+            copy_mode="EXPORT",
+            open_mode="EXPORT",
+        )
 
         if not asset_name:
-            warning = layout.row()
-            warning.alert = True
-            warning.label(text="Choose an asset to export Substance files.", icon="INFO")
+            _artpipe_draw_status_box(
+                layout,
+                [
+                    "Choose an asset to enable Substance tools.",
+                    "Import paths target the asset's local substance folders.",
+                ],
+                alert=True,
+            )
 
 
 class ARTPIPE_PT_standard_export_settings(Panel):
@@ -1381,13 +1449,16 @@ class ARTPIPE_PT_standard_export_settings(Panel):
         asset_name = state["asset_name"]
         export_collection = state["export_collection"]
 
-        row = layout.row(align=True)
-        row.prop(scene, "artpipe_export_preset", text="Export Preset")
+        settings_box = layout.box()
+        settings_col = settings_box.column(align=True)
+
+        row = settings_col.row(align=True)
+        row.prop(scene, "artpipe_export_preset", text="Preset")
         row.operator("artpipe.export_preset_file", text="", icon="EXPORT")
         row.operator("artpipe.import_preset_file", text="", icon="IMPORT")
 
-        row = layout.row(align=True)
-        row.prop(scene, "artpipe_export_path", text="Export Path")
+        row = settings_col.row(align=True)
+        row.prop(scene, "artpipe_export_path", text="Output")
         row.operator("artpipe.open_export_path", text="", icon="FOLDER_REDIRECT")
 
         export_ready = (
@@ -1398,20 +1469,20 @@ class ARTPIPE_PT_standard_export_settings(Panel):
         )
         row = layout.row(align=True)
         row.enabled = export_ready
-        row.operator("artpipe.export", icon="EXPORT", text="Export")
+        row.scale_y = 1.2
+        row.operator("artpipe.export", icon="EXPORT", text="Export Active Asset")
 
         if not export_ready:
-            warning = layout.column(align=True)
-            warning.alert = True
-            warning.label(text="Export prerequisites:", icon="INFO")
+            lines = ["Export prerequisites:"]
             if not asset_name:
-                warning.label(text="- Choose an asset")
+                lines.append("Choose an asset.")
             if not scene.artpipe_export_path:
-                warning.label(text="- Choose an Export Path")
+                lines.append("Choose an output folder.")
             if export_collection is None:
-                warning.label(text="- Asset is missing its export collection")
+                lines.append("Create the asset's export collection.")
             if not hasattr(bpy.ops.collection, "export_all"):
-                warning.label(text="- Requires Blender with Collection Exporters")
+                lines.append("Use a Blender build with Collection Exporters.")
+            _artpipe_draw_status_box(layout, lines, alert=True)
 
 
 classes = (
