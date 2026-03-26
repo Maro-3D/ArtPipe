@@ -417,6 +417,99 @@ def _artpipe_create_asset_setup(context, asset_name):
     )
 
 
+def _artpipe_iter_collection_objects_recursive(collection, seen=None):
+    if collection is None:
+        return []
+
+    if seen is None:
+        seen = set()
+
+    objects = []
+    for obj in collection.objects:
+        if obj.name_full in seen:
+            continue
+        seen.add(obj.name_full)
+        objects.append(obj)
+
+    for child in collection.children:
+        objects.extend(_artpipe_iter_collection_objects_recursive(child, seen))
+    return objects
+
+
+def _artpipe_clear_collection_objects(collection):
+    if collection is None:
+        return
+
+    for obj in list(collection.objects):
+        try:
+            collection.objects.unlink(obj)
+        except Exception:
+            pass
+
+        if not getattr(obj, "users_collection", ()):
+            try:
+                bpy.data.objects.remove(obj)
+            except Exception:
+                pass
+
+
+def _artpipe_sync_collection_objects(source_collection, target_collection):
+    if source_collection is None or target_collection is None:
+        return 0
+
+    source_objects = _artpipe_iter_collection_objects_recursive(source_collection)
+    _artpipe_clear_collection_objects(target_collection)
+
+    object_map = {}
+    for source_obj in source_objects:
+        new_obj = source_obj.copy()
+        data = getattr(source_obj, "data", None)
+        if data is not None and hasattr(data, "copy"):
+            try:
+                new_obj.data = data.copy()
+            except Exception:
+                pass
+
+        try:
+            new_obj.parent = None
+        except Exception:
+            pass
+
+        try:
+            target_collection.objects.link(new_obj)
+        except Exception:
+            continue
+
+        try:
+            new_obj.matrix_world = source_obj.matrix_world.copy()
+        except Exception:
+            pass
+
+        object_map[source_obj.name_full] = new_obj
+
+    for source_obj in source_objects:
+        new_obj = object_map.get(source_obj.name_full)
+        if new_obj is None:
+            continue
+
+        source_parent = getattr(source_obj, "parent", None)
+        if source_parent is None:
+            continue
+
+        new_parent = object_map.get(source_parent.name_full)
+        if new_parent is None:
+            continue
+
+        try:
+            new_obj.parent = new_parent
+            new_obj.matrix_parent_inverse = source_obj.matrix_parent_inverse.copy()
+            new_obj.matrix_world = source_obj.matrix_world.copy()
+        except Exception:
+            pass
+
+    return len(object_map)
+
+
 def _artpipe_configure_collection_exporter(
     collection,
     export_type,
@@ -1005,12 +1098,18 @@ class ARTPIPE_OT_export(Operator):
             self.report({"ERROR"}, f"Failed to create export directory: {exc}")
             return {"CANCELLED"}
 
+        source_collection = _artpipe_get_wip_child_collection(asset_name, "low_poly")
+        if source_collection is None:
+            self.report({"ERROR"}, f"Missing collection '{_artpipe_collection_name('low_poly', asset_name)}'.")
+            return {"CANCELLED"}
+
         export_collection = _artpipe_get_export_child_collection(asset_name, "engine")
         if export_collection is None:
             self.report({"ERROR"}, "Missing engine export collection. Create the asset setup first.")
             return {"CANCELLED"}
 
         try:
+            _artpipe_sync_collection_objects(source_collection, export_collection)
             _artpipe_export_collection(
                 context,
                 export_collection,
@@ -1227,6 +1326,14 @@ class ARTPIPE_OT_export_substance(Operator):
             return {"CANCELLED"}
 
         base_name = "substance_cage" if self.cage else "substance"
+        if not self.cage:
+            source_collection = _artpipe_get_wip_child_collection(asset_name, "low_poly")
+            if source_collection is None:
+                self.report({"ERROR"}, f"Missing collection '{_artpipe_collection_name('low_poly', asset_name)}'.")
+                return {"CANCELLED"}
+        else:
+            source_collection = None
+
         target_collection = _artpipe_get_export_child_collection(asset_name, base_name)
         if target_collection is None:
             self.report({"ERROR"}, f"Missing collection '{_artpipe_collection_name(base_name, asset_name)}'.")
@@ -1249,6 +1356,8 @@ class ARTPIPE_OT_export_substance(Operator):
         export_path = os.path.join(import_dir, f"{file_stem}.glb")
 
         try:
+            if source_collection is not None:
+                _artpipe_sync_collection_objects(source_collection, target_collection)
             _artpipe_export_collection(
                 context,
                 target_collection,
