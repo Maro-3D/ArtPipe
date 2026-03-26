@@ -161,7 +161,7 @@ def _artpipe_ui_state(context):
     if asset_name == "NONE":
         asset_name = ""
     asset_collection = bpy.data.collections.get(asset_name) if asset_name else None
-    export_collection = _artpipe_get_export_collection(asset_name)
+    export_collection = _artpipe_get_export_child_collection(asset_name, "engine")
     return {
         "scene": scene,
         "asset_name": asset_name,
@@ -254,6 +254,18 @@ def _artpipe_get_export_collection(asset_name):
     return None
 
 
+def _artpipe_get_export_child_collection(asset_name, base_name):
+    export_collection = _artpipe_get_export_collection(asset_name)
+    if export_collection is None:
+        return None
+
+    child_name = _artpipe_collection_name(base_name, asset_name)
+    for child in export_collection.children:
+        if child.name == child_name:
+            return child
+    return None
+
+
 def _artpipe_get_wip_collection(asset_name):
     if not asset_name:
         return None
@@ -340,7 +352,18 @@ def _artpipe_ensure_child_collection(parent, child_name, color_tag="NONE"):
             break
 
     if child is None:
+        child = bpy.data.collections.get(child_name)
+    if child is None:
         child = bpy.data.collections.new(child_name)
+
+    for collection in bpy.data.collections:
+        if collection == parent:
+            continue
+        if any(existing == child for existing in collection.children):
+            try:
+                collection.children.unlink(child)
+            except Exception:
+                pass
 
     already_linked = any(existing == child for existing in parent.children)
     if not already_linked:
@@ -361,7 +384,7 @@ def _artpipe_create_asset_setup(context, asset_name):
     wip_collection = _artpipe_ensure_child_collection(
         root_collection, _artpipe_collection_name("wip", asset_name), "COLOR_05"
     )
-    _artpipe_ensure_child_collection(
+    export_collection = _artpipe_ensure_child_collection(
         root_collection,
         _artpipe_collection_name("export", asset_name),
         "COLOR_04",
@@ -378,14 +401,19 @@ def _artpipe_create_asset_setup(context, asset_name):
         "COLOR_05",
     )
     _artpipe_ensure_child_collection(
-        wip_collection,
+        export_collection,
         _artpipe_collection_name("substance", asset_name),
         "COLOR_06",
     )
     _artpipe_ensure_child_collection(
-        wip_collection,
+        export_collection,
         _artpipe_collection_name("substance_cage", asset_name),
         "COLOR_06",
+    )
+    _artpipe_ensure_child_collection(
+        export_collection,
+        _artpipe_collection_name("engine", asset_name),
+        "COLOR_04",
     )
 
 
@@ -977,9 +1005,9 @@ class ARTPIPE_OT_export(Operator):
             self.report({"ERROR"}, f"Failed to create export directory: {exc}")
             return {"CANCELLED"}
 
-        export_collection = _artpipe_get_export_collection(asset_name)
+        export_collection = _artpipe_get_export_child_collection(asset_name, "engine")
         if export_collection is None:
-            self.report({"ERROR"}, "Missing export collection. Create the asset setup first.")
+            self.report({"ERROR"}, "Missing engine export collection. Create the asset setup first.")
             return {"CANCELLED"}
 
         try:
@@ -1199,7 +1227,7 @@ class ARTPIPE_OT_export_substance(Operator):
             return {"CANCELLED"}
 
         base_name = "substance_cage" if self.cage else "substance"
-        target_collection = _artpipe_get_wip_child_collection(asset_name, base_name)
+        target_collection = _artpipe_get_export_child_collection(asset_name, base_name)
         if target_collection is None:
             self.report({"ERROR"}, f"Missing collection '{_artpipe_collection_name(base_name, asset_name)}'.")
             return {"CANCELLED"}
@@ -1479,7 +1507,7 @@ class ARTPIPE_PT_standard_export_settings(Panel):
             if not scene.artpipe_export_path:
                 lines.append("Choose an output folder.")
             if export_collection is None:
-                lines.append("Create the asset's export collection.")
+                lines.append("Create the asset's engine export collection.")
             if not hasattr(bpy.ops.collection, "export_all"):
                 lines.append("Use a Blender build with Collection Exporters.")
             _artpipe_draw_status_box(layout, lines, alert=True)
